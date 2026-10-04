@@ -34,8 +34,19 @@ function secreto(env, nombre) {
 }
 
 function urlValida(valor, nombre) {
+  let limpio = (valor || '').trim();
+  if ((limpio.startsWith('"') && limpio.endsWith('"')) || (limpio.startsWith("'") && limpio.endsWith("'"))) {
+    limpio = limpio.slice(1, -1).trim();
+  }
+  const matchMd = limpio.match(/\]\((https?:\/\/[^\s)]+)\)/);
+  if (matchMd) {
+    limpio = matchMd[1].trim();
+  } else if (limpio.startsWith('[') && limpio.endsWith(']')) {
+    limpio = limpio.slice(1, -1).trim();
+  }
+
   try {
-    const url = new URL(valor);
+    const url = new URL(limpio);
     const hostLocal = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname.toLowerCase());
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && hostLocal)) throw new Error();
   } catch {
@@ -43,7 +54,7 @@ function urlValida(valor, nombre) {
       `${nombre} debe usar HTTPS; HTTP solo está permitido para localhost.`
     );
   }
-  return valor;
+  return limpio;
 }
 
 /**

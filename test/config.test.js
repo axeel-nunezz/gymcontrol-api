@@ -52,3 +52,13 @@ test('exige HTTPS en el redirect salvo durante desarrollo local', () => {
     assert.match(configuracion.google.redirectUri, /^http:/);
   }
 });
+
+test('limpia comillas y formato markdown accidental en redirect URI', () => {
+  const mdUri = '[https://gymcontrol-api.onrender.com/oauth/google/callback](https://gymcontrol-api.onrender.com/oauth/google/callback)';
+  const conf1 = cargarConfiguracion({ ...entornoValido(), GOOGLE_REDIRECT_URI: mdUri });
+  assert.equal(conf1.google.redirectUri, 'https://gymcontrol-api.onrender.com/oauth/google/callback');
+
+  const quotedUri = '"https://gymcontrol-api.onrender.com/oauth/google/callback"';
+  const conf2 = cargarConfiguracion({ ...entornoValido(), GOOGLE_REDIRECT_URI: quotedUri });
+  assert.equal(conf2.google.redirectUri, 'https://gymcontrol-api.onrender.com/oauth/google/callback');
+});
