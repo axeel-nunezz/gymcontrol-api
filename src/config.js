@@ -94,7 +94,7 @@ function cargarConfiguracion(env = process.env) {
       })
     }),
     maxBackupBytes: entero(env, 'MAX_BACKUP_MB', 64, 1, 256) * 1024 * 1024,
-    oauthVigenciaSegundos: 600,
+    oauthVigenciaSegundos: 1800,
     limites: Object.freeze({
       ventanaMs: 60 * 60 * 1000,
       subidasPorVentana: entero(env, 'BACKUP_RATE_LIMIT', 30, 1, 500),

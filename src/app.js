@@ -20,12 +20,20 @@ function crearLimitador(configuracion, limite) {
   });
 }
 
-function respuestaHtml(titulo, mensaje, codigoEntrega = '') {
-  const codigo = codigoEntrega
-    ? `<p>Código de entrega de un solo uso:</p><pre>${codigoEntrega}</pre>`
+function respuestaHtml(titulo, mensaje, contenidoCopiable = '', codigoEntrega = '') {
+  const bloqueCopia = contenidoCopiable
+    ? `<div style="background:#f1f5f9;border:1px solid #cbd5e1;padding:16px;border-radius:8px;margin-top:20px;text-align:left;">
+         <label style="font-weight:600;display:block;margin-bottom:8px;color:#1e293b;">GOOGLE_REFRESH_TOKEN (Copia este valor completo):</label>
+         <textarea readonly onclick="this.select()" style="width:100%;height:80px;padding:10px;font-family:monospace;font-size:13px;border:1px solid #94a3b8;border-radius:6px;box-sizing:border-box;resize:none;">${contenidoCopiable}</textarea>
+         <p style="color:#475569;font-size:13px;margin:10px 0 0 0;">👉 Pega este texto en <strong>Render &gt; Environment &gt; GOOGLE_REFRESH_TOKEN</strong> y presiona <strong>Save Changes</strong>.</p>
+       </div>`
+    : '';
+  const bloqueCodigo = codigoEntrega
+    ? `<p style="color:#64748b;font-size:12px;margin-top:12px;">Código de canje alternativo: <code>${codigoEntrega}</code></p>`
     : '';
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${titulo}</title></head>` +
-    `<body><main><h1>${titulo}</h1><p>${mensaje}</p>${codigo}</main></body></html>`;
+    `<body style="font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;max-width:620px;margin:50px auto;padding:24px;line-height:1.5;color:#1e293b;">` +
+    `<main><h1 style="color:#0f172a;margin-bottom:8px;font-size:24px;">${titulo}</h1><p style="margin:0;color:#334155;">${mensaje}</p>${bloqueCopia}${bloqueCodigo}</main></body></html>`;
 }
 
 function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger = console }) {
@@ -80,8 +88,9 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
         codigo: req.query.code,
         state: req.query.state
       });
-      res.type('html').send(respuestaHtml('Autorización completada',
-        `Copia este código y canjéalo dentro de ${resultado.expiresInSeconds} segundos.`,
+      res.type('html').send(respuestaHtml('Autorización completada con éxito',
+        'Tu cuenta de Google fue vinculada correctamente con GymControl.',
+        resultado.refreshToken,
         resultado.codigoEntrega));
     } catch (error) {
       const estado = error instanceof ErrorHttp ? error.estado : 500;

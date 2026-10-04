@@ -15,6 +15,7 @@ class ServicioOAuthBootstrap {
     this.reloj = reloj;
     this.oauthYaConfigurado = Boolean(configuracion.google.refreshToken);
     this.noncesPendientes = new Map();
+    this.noncesConsumidos = new Map();
     this.tokensParaEntregar = new Map();
     this.cliente = new google.auth.OAuth2(
       configuracion.google.clientId,
@@ -65,7 +66,11 @@ class ServicioOAuthBootstrap {
     const codigoEntrega = crypto.randomBytes(32).toString('base64url');
     const expiraEn = Math.floor(this.reloj() / 1000) + this.configuracion.oauthVigenciaSegundos;
     this.tokensParaEntregar.set(codigoEntrega, { refreshToken, expiraEn });
-    return { codigoEntrega, expiresInSeconds: this.configuracion.oauthVigenciaSegundos };
+    return {
+      refreshToken,
+      codigoEntrega,
+      expiresInSeconds: this.configuracion.oauthVigenciaSegundos
+    };
   }
 
   entregarRefreshToken(codigoEntrega) {
@@ -97,12 +102,15 @@ class ServicioOAuthBootstrap {
     } catch {
       throw new ErrorHttp(400, 'OAUTH_STATE_INVALIDO', 'La solicitud OAuth no es válida o venció.');
     }
-    const expiraRegistrado = this.noncesPendientes.get(carga.nonce);
-    this.noncesPendientes.delete(carga.nonce);
     const ahora = Math.floor(this.reloj() / 1000);
-    if (!expiraRegistrado || carga.expiraEn !== expiraRegistrado || carga.expiraEn < ahora) {
+    if (!carga?.nonce || typeof carga.expiraEn !== 'number' || carga.expiraEn < ahora) {
       throw new ErrorHttp(400, 'OAUTH_STATE_INVALIDO', 'La solicitud OAuth no es válida o venció.');
     }
+    if (this.noncesConsumidos.has(carga.nonce)) {
+      throw new ErrorHttp(400, 'OAUTH_STATE_INVALIDO', 'La solicitud OAuth ya fue utilizada.');
+    }
+    this.noncesConsumidos.set(carga.nonce, carga.expiraEn);
+    this.noncesPendientes.delete(carga.nonce);
   }
 
   #firmar(carga) {
@@ -114,6 +122,9 @@ class ServicioOAuthBootstrap {
     const ahora = Math.floor(this.reloj() / 1000);
     for (const [nonce, expiraEn] of this.noncesPendientes) {
       if (expiraEn < ahora) this.noncesPendientes.delete(nonce);
+    }
+    for (const [nonce, expiraEn] of this.noncesConsumidos) {
+      if (expiraEn < ahora) this.noncesConsumidos.delete(nonce);
     }
     for (const [codigo, registro] of this.tokensParaEntregar) {
       if (registro.expiraEn < ahora) this.tokensParaEntregar.delete(codigo);
