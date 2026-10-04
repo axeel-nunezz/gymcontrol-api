@@ -1,14 +1,22 @@
 {
   "name": "gymcontrol-api",
-  "version": "1.0.0",
-  "description": "Backend para OAuth y Google APIs de GymControl",
+  "version": "1.1.0",
+  "description": "Backend seguro para respaldos de GymControl en Google Drive y notificaciones por Gmail",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check src/app.js && node --check src/config.js && node --check src/google-service.js && node --check src/oauth-service.js && node --check src/security.js"
   },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "pnpm@11.25.0",
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "googleapis": "^140.0.1"
+    "dotenv": "18.0.5",
+    "express": "5.2.1",
+    "express-rate-limit": "8.7.0",
+    "googleapis": "182.0.0",
+    "helmet": "8.3.0"
   }
 }
