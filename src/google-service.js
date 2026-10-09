@@ -31,6 +31,7 @@ class ServicioGoogle {
     this.drive = google.drive({ version: 'v3', auth: this.oauth2 });
     this.gmail = google.gmail({ version: 'v1', auth: this.oauth2 });
     this.promesaCarpeta = null;
+    this.promesaCarpetaCaja = null;
     this.bloqueosPorHwid = new Map();
     this.#aplicarCredenciales();
   }
@@ -48,20 +49,116 @@ class ServicioGoogle {
   }
 
   async subirRespaldo(datos) {
-    const previo = this.bloqueosPorHwid.get(datos.hwid) || Promise.resolve();
+    return this.#serializarPorHwid(datos.hwid, () => this.#subirRespaldoSerializado(datos));
+  }
+
+  async #serializarPorHwid(hwid, operacion) {
+    const previo = this.bloqueosPorHwid.get(hwid) || Promise.resolve();
     let liberar;
     const turnoActual = new Promise((resolve) => { liberar = resolve; });
     const colaActual = previo.then(() => turnoActual);
-    this.bloqueosPorHwid.set(datos.hwid, colaActual);
+    this.bloqueosPorHwid.set(hwid, colaActual);
     await previo;
     try {
-      return await this.#subirRespaldoSerializado(datos);
+      return await operacion();
     } finally {
       liberar();
-      if (this.bloqueosPorHwid.get(datos.hwid) === colaActual) {
-        this.bloqueosPorHwid.delete(datos.hwid);
+      if (this.bloqueosPorHwid.get(hwid) === colaActual) {
+        this.bloqueosPorHwid.delete(hwid);
       }
     }
+  }
+
+  async subirReporteCaja(datos) {
+    return this.#serializarPorHwid(datos.hwid, () => this.#subirReporteCajaSerializado(datos));
+  }
+
+  async #subirReporteCajaSerializado({ hwid, periodo, estado, nombreArchivo, contenido, sha256 }) {
+    this.#exigirConfiguracion();
+    try {
+      const carpetaId = await this.#obtenerCarpetaCajaId();
+      const anteriores = await this.#buscarArchivos(carpetaId, nombreArchivo);
+      const md5 = crypto.createHash('md5').update(contenido).digest('hex');
+      const propiedades = { gymcontrolHwid: hwid, gymcontrolOrigen: 'GymControlCaja',
+        gymcontrolPeriodo: periodo, gymcontrolEstado: estado };
+      const media = { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        body: Readable.from([contenido]) };
+      let archivoId = anteriores[0]?.id;
+      if (archivoId) {
+        await this.drive.files.update({ fileId: archivoId, supportsAllDrives: true,
+          requestBody: { name: nombreArchivo, appProperties: propiedades }, media, fields: 'id' });
+      } else {
+        const creado = await this.drive.files.create({ supportsAllDrives: true,
+          requestBody: { name: nombreArchivo, parents: [carpetaId],
+            mimeType: media.mimeType, appProperties: propiedades }, media, fields: 'id' });
+        archivoId = creado.data.id;
+      }
+      const metadatos = await this.#obtenerMetadatos(archivoId);
+      if (Number(metadatos.size) !== contenido.length || metadatos.md5Checksum !== md5) {
+        throw new ErrorHttp(502, 'REPORTE_NO_VERIFICADO',
+          'Drive recibió el reporte, pero no fue posible verificar su integridad.');
+      }
+      let eliminados = 0;
+      let fallosLimpieza = 0;
+      let conservadoEnDrive = true;
+      const eliminar = async (id) => {
+        try {
+          await this.drive.files.delete({ fileId: id, supportsAllDrives: true });
+          eliminados += 1;
+          return true;
+        } catch (error) {
+          fallosLimpieza += 1;
+          this.logger.warn(`[GymControl API] No se pudo depurar reporte de caja ${id}: ${error.message}`);
+          return false;
+        }
+      };
+      for (const duplicado of anteriores.slice(1)) await eliminar(duplicado.id);
+      if (estado === 'FINAL') {
+        const archivos = await this.#listarReportesCaja(carpetaId, hwid);
+        const finales = new Map();
+        for (const archivo of [{ id: archivoId, name: nombreArchivo }, ...archivos]) {
+          const match = archivo.name.match(/^ReporteCaja_(\d{4}-(?:0[1-9]|1[0-2]))_GYM-\d{4}-[A-Z]_(FINAL|PARCIAL)\.xlsx$/);
+          if (!match || match[2] !== 'FINAL' ||
+              archivo.name !== `ReporteCaja_${match[1]}_${hwid}_FINAL.xlsx`) continue;
+          if (!finales.has(match[1])) finales.set(match[1], []);
+          if (!finales.get(match[1]).some((item) => item.id === archivo.id)) {
+            finales.get(match[1]).push(archivo);
+          }
+        }
+        const meses = [...finales.keys()].sort().reverse();
+        const mantener = new Set(meses.slice(0, 2));
+        for (const [mes, items] of finales) {
+          for (const item of items) {
+            if (!mantener.has(mes) || (item.id !== archivoId && items.indexOf(item) > 0)) {
+              const eliminado = await eliminar(item.id);
+              if (item.id === archivoId && eliminado) conservadoEnDrive = false;
+            }
+          }
+        }
+        for (const archivo of archivos) {
+          const match = archivo.name.match(/^ReporteCaja_(\d{4}-(?:0[1-9]|1[0-2]))_GYM-\d{4}-[A-Z]_PARCIAL\.xlsx$/);
+          if (match && finales.has(match[1]) &&
+              archivo.name === `ReporteCaja_${match[1]}_${hwid}_PARCIAL.xlsx`) {
+            await eliminar(archivo.id);
+          }
+        }
+      }
+      return { archivoId, nombreArchivo, periodo, estado, tamanioBytes: contenido.length,
+        sha256, eliminados, fallosLimpieza, conservadoEnDrive,
+        generadoEn: new Date().toISOString() };
+    } catch (error) {
+      if (error instanceof ErrorHttp) throw error;
+      throw errorGoogle('guardar el reporte de caja', error);
+    }
+  }
+
+  async enviarReporteCajaPorCorreo(datos) {
+    return this.#enviarAdjuntoMime({ destinatario: datos.destinatario,
+      nombreArchivo: datos.nombreArchivo, contenido: datos.contenido,
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      asunto: `GymControl - Balance de Caja ${datos.periodo} - ${datos.estado}`,
+      html: `<p>Reporte mensual de caja: ${escaparHtml(datos.periodo)} (${escaparHtml(datos.estado)}).</p>` +
+        `<p>Equipo: ${escaparHtml(datos.hwid)}</p>` });
   }
 
   async #subirRespaldoSerializado({ hwid, nombreArchivo, contenido, sha256 }) {
@@ -178,6 +275,53 @@ class ServicioGoogle {
     }
   }
 
+  async enviarAdjuntoPorCorreo({ destinatario, hwid, nombreArchivo, contenido,
+    mimeType, incluyeAccesos }) {
+    const esExcel = mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    const asunto = esExcel
+      ? 'GymControl - Padrón de Socios' + (incluyeAccesos ? ' y Accesos' : '')
+      : 'GymControl - Respaldo de Base de Datos';
+    const descripcion = esExcel
+      ? `Padrón operativo de socios${incluyeAccesos ? ' y accesos del último mes' : ''}.`
+      : 'Copia completa de la base de datos para restauración.';
+    return this.#enviarAdjuntoMime({ destinatario, nombreArchivo, contenido, mimeType,
+      asunto, html: `<p>${escaparHtml(descripcion)}</p><p>Equipo: ${escaparHtml(hwid)}</p>` });
+  }
+
+  async #enviarAdjuntoMime({ destinatario, nombreArchivo, contenido, mimeType, asunto, html }) {
+    this.#exigirConfiguracion();
+    const frontera = `gymcontrol-${crypto.randomUUID()}`;
+    const mensaje = [
+      `To: ${destinatario}`,
+      `Subject: =?UTF-8?B?${Buffer.from(asunto, 'utf8').toString('base64')}?=`,
+      'MIME-Version: 1.0',
+      `Content-Type: multipart/mixed; boundary="${frontera}"`,
+      '',
+      `--${frontera}`,
+      'Content-Type: text/html; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      Buffer.from(html, 'utf8').toString('base64'),
+      `--${frontera}`,
+      `Content-Type: ${mimeType}; name="${nombreArchivo}"`,
+      `Content-Disposition: attachment; filename="${nombreArchivo}"`,
+      'Content-Transfer-Encoding: base64',
+      '',
+      contenido.toString('base64').replace(/.{76}/g, '$&\r\n'),
+      `--${frontera}--`,
+      ''
+    ].join('\r\n');
+    try {
+      await this.gmail.users.messages.send({
+        userId: 'me', requestBody: { raw: Buffer.from(mensaje, 'utf8').toString('base64url') }
+      });
+      return { destinatario, nombreArchivo, tamanioBytes: contenido.length,
+        enviadoEn: new Date().toISOString() };
+    } catch (error) {
+      throw errorGoogle('enviar el archivo adjunto por Gmail', error);
+    }
+  }
+
   #aplicarCredenciales() {
     this.oauth2.setCredentials(this.refreshToken ? { refresh_token: this.refreshToken } : {});
   }
@@ -200,6 +344,47 @@ class ServicioGoogle {
       });
     }
     return this.promesaCarpeta;
+  }
+
+  async #obtenerCarpetaCajaId() {
+    if (!this.promesaCarpetaCaja) {
+      this.promesaCarpetaCaja = (async () => {
+        const padre = await this.#obtenerCarpetaId();
+        const respuesta = await this.drive.files.list({
+          q: `'${escaparConsultaDrive(padre)}' in parents and name = 'Reportes_Caja' and ` +
+            "mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+          spaces: 'drive', pageSize: 100, fields: 'nextPageToken,files(id,name)',
+          supportsAllDrives: true, includeItemsFromAllDrives: true
+        });
+        if (respuesta.data.files?.length) return respuesta.data.files[0].id;
+        const creada = await this.drive.files.create({ supportsAllDrives: true,
+          requestBody: { name: 'Reportes_Caja', mimeType: 'application/vnd.google-apps.folder',
+            parents: [padre] }, fields: 'id' });
+        return creada.data.id;
+      })().catch((error) => { this.promesaCarpetaCaja = null; throw error; });
+    }
+    return this.promesaCarpetaCaja;
+  }
+
+  async #listarReportesCaja(carpetaId, hwid) {
+    const archivos = [];
+    let pageToken;
+    do {
+      const respuesta = await this.drive.files.list({
+        q: `'${escaparConsultaDrive(carpetaId)}' in parents and ` +
+          "name contains 'ReporteCaja_' and trashed = false",
+        spaces: 'drive', pageSize: 1000, pageToken,
+        fields: 'nextPageToken,files(id,name,appProperties)',
+        supportsAllDrives: true, includeItemsFromAllDrives: true
+      });
+      for (const archivo of respuesta.data.files || []) {
+        if (archivo.name?.includes(`_${hwid}_`) &&
+            (!archivo.appProperties || (archivo.appProperties.gymcontrolOrigen === 'GymControlCaja' &&
+              archivo.appProperties.gymcontrolHwid === hwid))) archivos.push(archivo);
+      }
+      pageToken = respuesta.data.nextPageToken;
+    } while (pageToken);
+    return archivos;
   }
 
   async #validarCarpetaExplicita(carpetaId) {

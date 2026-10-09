@@ -8,6 +8,37 @@ const { ErrorHttp } = require('./errors');
 const { autenticarBearer, compararSeguro, validarCorreo, validarHwid } = require('./security');
 
 const CABECERA_SQLITE = Buffer.from('SQLite format 3\0', 'ascii');
+const CABECERA_ZIP = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+const MAX_ADJUNTO_BYTES = 18 * 1024 * 1024;
+
+function validarReporteCaja(req, requiereCorreo = false) {
+  const { hwid, period: periodo, state: estado } = req.params;
+  if (!validarHwid(hwid) || !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo) ||
+      !['PARCIAL', 'FINAL'].includes(estado)) {
+    throw new ErrorHttp(400, 'REPORTE_INVALIDO', 'Equipo, período o estado de reporte inválido.');
+  }
+  if (!req.is('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
+    throw new ErrorHttp(415, 'TIPO_CONTENIDO_INVALIDO', 'El reporte debe enviarse como XLSX.');
+  }
+  if (!Buffer.isBuffer(req.body) || req.body.length <= CABECERA_ZIP.length ||
+      !req.body.subarray(0, CABECERA_ZIP.length).equals(CABECERA_ZIP)) {
+    throw new ErrorHttp(422, 'EXCEL_INVALIDO', 'El archivo enviado no es un XLSX válido.');
+  }
+  const sha256 = req.get('X-Content-SHA256');
+  if (!sha256 || !/^[a-f0-9]{64}$/i.test(sha256)) {
+    throw new ErrorHttp(400, 'SHA256_AUSENTE', 'Debes enviar una huella SHA-256 válida.');
+  }
+  const calculado = crypto.createHash('sha256').update(req.body).digest('hex');
+  if (!compararSeguro(sha256.toLowerCase(), calculado)) {
+    throw new ErrorHttp(422, 'SHA256_NO_COINCIDE', 'La huella SHA-256 no coincide con el reporte.');
+  }
+  const destinatario = req.get('X-Recipient-Email')?.trim() || '';
+  if (requiereCorreo && !validarCorreo(destinatario)) {
+    throw new ErrorHttp(400, 'CORREO_INVALIDO', 'La dirección de correo no tiene un formato válido.');
+  }
+  return { hwid, periodo, estado, destinatario, sha256: calculado,
+    nombreArchivo: `ReporteCaja_${periodo}_${hwid}_${estado}.xlsx`, contenido: req.body };
+}
 
 function crearLimitador(configuracion, limite) {
   return rateLimit({
@@ -179,6 +210,81 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
         const resultado = await servicioGoogle.enviarRespaldoPorCorreo({
           hwid, nombreArchivo, destinatario
         });
+        res.json({ ok: true, ...resultado });
+      } catch (error) {
+        next(error);
+      }
+    });
+
+  app.post('/api/v1/backups/:hwid/email-attachment', limitarCorreos, autenticarApi,
+    express.raw({ type: ['application/x-sqlite3',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    limit: Math.min(configuracion.maxBackupBytes, MAX_ADJUNTO_BYTES) }), async (req, res, next) => {
+      try {
+        const { hwid } = req.params;
+        if (!validarHwid(hwid)) {
+          throw new ErrorHttp(400, 'HWID_INVALIDO', 'El identificador del equipo no tiene un formato válido.');
+        }
+        const destinatario = req.get('X-Recipient-Email')?.trim() || '';
+        if (!validarCorreo(destinatario)) {
+          throw new ErrorHttp(400, 'CORREO_INVALIDO', 'La dirección de correo no tiene un formato válido.');
+        }
+        const esExcel = req.is('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        const esSqlite = req.is('application/x-sqlite3');
+        if (!esExcel && !esSqlite) {
+          throw new ErrorHttp(415, 'TIPO_CONTENIDO_INVALIDO', 'El adjunto debe ser SQLite o Excel.');
+        }
+        const cabecera = esExcel ? CABECERA_ZIP : CABECERA_SQLITE;
+        if (!Buffer.isBuffer(req.body) || req.body.length <= cabecera.length ||
+            !req.body.subarray(0, cabecera.length).equals(cabecera)) {
+          throw new ErrorHttp(422, 'ADJUNTO_INVALIDO', 'El archivo adjunto no coincide con su formato.');
+        }
+        const sha256 = req.get('X-Content-SHA256');
+        if (!sha256 || !/^[a-f0-9]{64}$/i.test(sha256)) {
+          throw new ErrorHttp(400, 'SHA256_AUSENTE', 'Debes enviar una huella SHA-256 válida.');
+        }
+        const calculado = crypto.createHash('sha256').update(req.body).digest('hex');
+        if (!compararSeguro(sha256.toLowerCase(), calculado)) {
+          throw new ErrorHttp(422, 'SHA256_NO_COINCIDE', 'La huella SHA-256 no coincide con el adjunto.');
+        }
+        const accesos = req.get('X-Report-Accesses');
+        if (esExcel && !['true', 'false'].includes(accesos)) {
+          throw new ErrorHttp(400, 'OPCION_ACCESOS_INVALIDA', 'Indica si el Excel incluye accesos.');
+        }
+        const nombreArchivo = esExcel
+          ? `GymControl_Socios_${hwid}.xlsx`
+          : `GymControl_Respaldo_${hwid}.db`;
+        const resultado = await servicioGoogle.enviarAdjuntoPorCorreo({
+          destinatario, hwid, nombreArchivo, contenido: req.body,
+          mimeType: esExcel
+            ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            : 'application/x-sqlite3',
+          incluyeAccesos: esExcel && accesos === 'true'
+        });
+        res.json({ ok: true, ...resultado });
+      } catch (error) {
+        next(error);
+      }
+    });
+
+  const tipoExcel = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  app.put('/api/v1/reports/cash/:hwid/:period/:state', limitarSubidas, autenticarApi,
+    express.raw({ type: tipoExcel, limit: configuracion.maxBackupBytes }), async (req, res, next) => {
+      try {
+        const datos = validarReporteCaja(req);
+        const resultado = await servicioGoogle.subirReporteCaja(datos);
+        res.json({ ok: true, ...resultado });
+      } catch (error) {
+        next(error);
+      }
+    });
+
+  app.post('/api/v1/reports/cash/:hwid/:period/:state/email', limitarCorreos, autenticarApi,
+    express.raw({ type: tipoExcel, limit: Math.min(configuracion.maxBackupBytes, MAX_ADJUNTO_BYTES) }),
+    async (req, res, next) => {
+      try {
+        const datos = validarReporteCaja(req, true);
+        const resultado = await servicioGoogle.enviarReporteCajaPorCorreo(datos);
         res.json({ ok: true, ...resultado });
       } catch (error) {
         next(error);

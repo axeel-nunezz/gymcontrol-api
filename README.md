@@ -99,6 +99,42 @@ El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Los códigos temporales se 
 
 Todas las rutas `/api/v1` requieren `Authorization: Bearer <GYMCONTROL_API_KEY>`.
 
+### Reportes mensuales de caja
+
+El escritorio genera `ReporteCaja_YYYY-MM_<HWID>_PARCIAL.xlsx` para el mes en curso y
+`ReporteCaja_YYYY-MM_<HWID>_FINAL.xlsx` para un mes cerrado. Guarda una copia en
+`%LOCALAPPDATA%\GymControl\reportes\caja\` y envía el XLSX al backend:
+
+```http
+PUT /api/v1/reports/cash/GYM-1234-A/2026-09/FINAL
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+X-Content-SHA256: <64 caracteres hexadecimales>
+Authorization: Bearer <clave>
+
+<bytes del XLSX>
+```
+
+El backend lo guarda en la subcarpeta `Reportes_Caja` de la carpeta de respaldos.
+Al consolidar un período elimina su parcial y mantiene únicamente los dos meses
+finales más recientes por equipo. Los errores de borrado se registran sin cancelar
+la subida; la respuesta incluye `fallosLimpieza`. Un reporte histórico fuera de esos
+dos meses permanece local, y `conservadoEnDrive` informa `false`.
+
+Para adjuntarlo por Gmail sin guardar credenciales de Google en el equipo:
+
+```http
+POST /api/v1/reports/cash/GYM-1234-A/2026-09/FINAL/email
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+X-Content-SHA256: <64 caracteres hexadecimales>
+X-Recipient-Email: persona@ejemplo.com
+Authorization: Bearer <clave>
+
+<bytes del XLSX>
+```
+
+El adjunto para Gmail tiene un límite de 18 MiB. Ambas rutas derivan el nombre del
+HWID, período y estado validados; no aceptan nombres arbitrarios del cliente.
+
 ### Subir o reemplazar un respaldo
 
 ```http
@@ -140,22 +176,36 @@ Authorization: Bearer <clave>
 
 La ruta busca el respaldo estable del HWID, concede acceso de lectura si aún no existe y envía un correo con enlace, fecha, hora y tamaño del respaldo.
 
-## Desarrollo local
+### Enviar un archivo adjunto desde el escritorio
 
-```powershell
-Copy-Item .env.example .env
-# Completa .env solo en tu equipo; está excluido por Git.
-pnpm install --frozen-lockfile
-pnpm check
-pnpm test
-pnpm start
+```http
+POST /api/v1/backups/GYM-1234-A/email-attachment
+Authorization: Bearer <clave>
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+X-Recipient-Email: persona@ejemplo.com
+X-Content-SHA256: <64 caracteres hexadecimales>
+X-Report-Accesses: false
+
+<bytes del XLSX>
 ```
 
-Las pruebas no llaman a Google: usan servicios simulados y verifican autenticación, validaciones, integridad y el contrato HTTP.
+Para la base completa, usa `Content-Type: application/x-sqlite3` y envía el snapshot SQLite consistente. La ruta admite hasta 18 MiB por adjunto, comprueba la firma y SHA-256, deriva el nombre desde el HWID y envía el archivo directamente por Gmail. El Excel no se guarda en Drive. `X-Report-Accesses` indica si el reporte incluye la hoja opcional; para SQLite se ignora. El endpoint de enlace anterior y la sincronización automática con Drive siguen disponibles.
+
+## Carpeta lista para despliegue
+
+Esta raíz contiene únicamente el código y la configuración necesarios para construir
+el backend en Render: `Dockerfile`, `package.json`, `pnpm-lock.yaml`, `server.js` y `src/`.
+La carpeta `gymcontrol-api/` conserva el repositorio de desarrollo y sus pruebas,
+pero está excluida por `.gitignore` y `.dockerignore`. No la agregues al repositorio
+exterior ni configures Render para construir desde ella.
+
+Para comprobar sintaxis localmente, ejecuta `node --check server.js` y
+`node --check src/app.js`. Las pruebas automatizadas permanecen en el repositorio
+interior y no se incluyen en esta copia de producción.
 
 ## Render y Docker
 
-El `Dockerfile` usa Node 24, instala dependencias desde `pnpm-lock.yaml` y ejecuta el proceso con el usuario sin privilegios `node`. En Render selecciona el runtime Docker y usa `/health` como Health Check Path. El disco local no guarda respaldos. Los códigos OAuth temporales sí se pierden si la instancia reinicia durante el bootstrap.
+El `Dockerfile` usa Node 24, instala dependencias desde `pnpm-lock.yaml` y ejecuta el proceso con el usuario sin privilegios `node`. En Render selecciona el runtime Docker, la raíz de este repositorio como Root Directory, `./Dockerfile` como Dockerfile Path y `/health` como Health Check Path. El disco local no guarda respaldos. Los códigos OAuth temporales sí se pierden si la instancia reinicia durante el bootstrap.
 
 ## Seguridad operativa
 

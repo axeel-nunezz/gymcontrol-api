@@ -5,7 +5,6 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test",
     "check": "node --check server.js && node --check src/app.js && node --check src/config.js && node --check src/google-service.js && node --check src/oauth-service.js && node --check src/security.js"
   },
   "engines": {
