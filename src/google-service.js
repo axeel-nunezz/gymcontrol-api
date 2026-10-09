@@ -82,7 +82,7 @@ class ServicioGoogle {
       const propiedades = { gymcontrolHwid: hwid, gymcontrolOrigen: 'GymControlCaja',
         gymcontrolPeriodo: periodo, gymcontrolEstado: estado };
       const media = { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        body: Readable.from([contenido]) };
+        body: contenido };
       let archivoId = anteriores[0]?.id;
       if (archivoId) {
         await this.drive.files.update({ fileId: archivoId, supportsAllDrives: true,
@@ -170,7 +170,7 @@ class ServicioGoogle {
       const md5Local = crypto.createHash('md5').update(contenido).digest('hex');
       const media = {
         mimeType: 'application/x-sqlite3',
-        body: Readable.from([contenido])
+        body: contenido
       };
 
       let creado = false;

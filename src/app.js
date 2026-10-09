@@ -261,6 +261,15 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
             : 'application/x-sqlite3',
           incluyeAccesos: esExcel && accesos === 'true'
         });
+        
+        if (esSqlite) {
+          try {
+            await servicioGoogle.subirRespaldo({ hwid, nombreArchivo, contenido: req.body, sha256: calculado });
+          } catch (e) {
+            console.error(`[GymControl API] Omitiendo error no crítico al sincronizar DB tras enviar correo: ${e.message}`);
+          }
+        }
+        
         res.json({ ok: true, ...resultado });
       } catch (error) {
         next(error);
