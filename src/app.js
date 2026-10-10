@@ -5,7 +5,8 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 
 const { ErrorHttp } = require('./errors');
-const { autenticarBearer, compararSeguro, validarCorreo, validarHwid } = require('./security');
+const { autenticarBearer, autenticarCliente, recibirCredencialCliente,
+  compararSeguro, validarCorreo, validarHwid } = require('./security');
 
 const CABECERA_SQLITE = Buffer.from('SQLite format 3\0', 'ascii');
 const CABECERA_ZIP = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
@@ -16,6 +17,15 @@ function validarReporteCaja(req, requiereCorreo = false) {
   if (!validarHwid(hwid) || !/^\d{4}-(0[1-9]|1[0-2])$/.test(periodo) ||
       !['PARCIAL', 'FINAL'].includes(estado)) {
     throw new ErrorHttp(400, 'REPORTE_INVALIDO', 'Equipo, período o estado de reporte inválido.');
+  }
+  const partesFecha = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Argentina/Buenos_Aires', year: 'numeric', month: '2-digit'
+  }).formatToParts(new Date());
+  const anio = partesFecha.find((parte) => parte.type === 'year').value;
+  const mes = partesFecha.find((parte) => parte.type === 'month').value;
+  const mesActual = `${anio}-${mes}`;
+  if (periodo > mesActual || (estado === 'FINAL' && periodo === mesActual)) {
+    throw new ErrorHttp(400, 'PERIODO_NO_CERRADO', 'El período solicitado todavía no está cerrado.');
   }
   if (!req.is('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
     throw new ErrorHttp(415, 'TIPO_CONTENIDO_INVALIDO', 'El reporte debe enviarse como XLSX.');
@@ -78,11 +88,12 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
     next();
   });
 
-  const autenticarApi = autenticarBearer(configuracion.apiKey, 'API_KEY_INVALIDA');
+  const autenticarApi = autenticarCliente(servicioGoogle);
   const autenticarAdmin = autenticarBearer(configuracion.oauthAdminKey, 'ADMIN_KEY_INVALIDA');
   const limitarSubidas = crearLimitador(configuracion, configuracion.limites.subidasPorVentana);
   const limitarCorreos = crearLimitador(configuracion, configuracion.limites.correosPorVentana);
   const limitarOAuth = crearLimitador(configuracion, configuracion.limites.oauthPorVentana);
+  const limitarRegistros = crearLimitador(configuracion, 30);
 
   app.get('/', (_req, res) => {
     res.json({ ok: true, servicio: 'GymControl API' });
@@ -152,11 +163,22 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
       }
     });
 
+  app.post('/api/v1/clients/:hwid/register', limitarRegistros, recibirCredencialCliente,
+    async (req, res, next) => {
+      try {
+        const resultado = await servicioGoogle.registrarCliente(
+          req.hwidAutenticado, req.credencialCliente);
+        res.status(resultado.creado ? 201 : 200).json({ ok: true, ...resultado });
+      } catch (error) {
+        next(error);
+      }
+    });
+
   app.put('/api/v1/backups/:hwid', limitarSubidas, autenticarApi,
     express.raw({ type: ['application/x-sqlite3', 'application/vnd.sqlite3', 'application/octet-stream'],
       limit: configuracion.maxBackupBytes }), async (req, res, next) => {
       try {
-        const { hwid } = req.params;
+        const hwid = req.hwidAutenticado;
         if (!validarHwid(hwid)) {
           throw new ErrorHttp(400, 'HWID_INVALIDO', 'El identificador del equipo no tiene un formato válido.');
         }
@@ -180,7 +202,8 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
 
         const nombreArchivo = `GymControl_Respaldo_${hwid}.db`;
         const resultado = await servicioGoogle.subirRespaldo({
-          hwid, nombreArchivo, contenido: req.body, sha256: sha256Calculado
+          hwid, clienteId: req.clienteId, nombreArchivo,
+          contenido: req.body, sha256: sha256Calculado
         });
         res.status(resultado.creado ? 201 : 200).json({ ok: true, ...resultado });
       } catch (error) {
@@ -191,7 +214,7 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
   app.post('/api/v1/backups/:hwid/email', limitarCorreos, autenticarApi,
     express.json({ limit: '16kb', strict: true }), async (req, res, next) => {
       try {
-        const { hwid } = req.params;
+        const hwid = req.hwidAutenticado;
         if (!validarHwid(hwid)) {
           throw new ErrorHttp(400, 'HWID_INVALIDO', 'El identificador del equipo no tiene un formato válido.');
         }
@@ -208,7 +231,7 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
         }
         const nombreArchivo = `GymControl_Respaldo_${hwid}.db`;
         const resultado = await servicioGoogle.enviarRespaldoPorCorreo({
-          hwid, nombreArchivo, destinatario
+          hwid, clienteId: req.clienteId, nombreArchivo, destinatario
         });
         res.json({ ok: true, ...resultado });
       } catch (error) {
@@ -221,7 +244,7 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
     limit: Math.min(configuracion.maxBackupBytes, MAX_ADJUNTO_BYTES) }), async (req, res, next) => {
       try {
-        const { hwid } = req.params;
+        const hwid = req.hwidAutenticado;
         if (!validarHwid(hwid)) {
           throw new ErrorHttp(400, 'HWID_INVALIDO', 'El identificador del equipo no tiene un formato válido.');
         }
@@ -262,15 +285,21 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
           incluyeAccesos: esExcel && accesos === 'true'
         });
         
+        let drive = { sincronizado: esSqlite ? false : null, error: null };
         if (esSqlite) {
           try {
-            await servicioGoogle.subirRespaldo({ hwid, nombreArchivo, contenido: req.body, sha256: calculado });
+             await servicioGoogle.subirRespaldo({ hwid, clienteId: req.clienteId,
+               nombreArchivo, contenido: req.body, sha256: calculado });
+            drive = { sincronizado: true, error: null };
           } catch (e) {
-            console.error(`[GymControl API] Omitiendo error no crítico al sincronizar DB tras enviar correo: ${e.message}`);
+            logger.error(`[GymControl API] ${req.idSolicitud} no se pudo sincronizar Drive después del correo.`);
+            drive = { sincronizado: false, error: {
+              codigo: e instanceof ErrorHttp ? e.codigo : 'DRIVE_NO_SINCRONIZADO',
+              mensaje: e instanceof ErrorHttp ? e.message : 'No se pudo sincronizar el respaldo en Drive.'
+            } };
           }
         }
-        
-        res.json({ ok: true, ...resultado });
+        res.json({ ok: true, ...resultado, email: { enviado: true }, drive });
       } catch (error) {
         next(error);
       }
@@ -281,7 +310,7 @@ function crearAplicacion({ configuracion, servicioGoogle, servicioOAuth, logger 
     express.raw({ type: tipoExcel, limit: configuracion.maxBackupBytes }), async (req, res, next) => {
       try {
         const datos = validarReporteCaja(req);
-        const resultado = await servicioGoogle.subirReporteCaja(datos);
+        const resultado = await servicioGoogle.subirReporteCaja({ ...datos, clienteId: req.clienteId });
         res.json({ ok: true, ...resultado });
       } catch (error) {
         next(error);

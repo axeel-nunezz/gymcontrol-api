@@ -1,8 +1,8 @@
 # GymControl API
 
-Backend privado de GymControl para centralizar las credenciales de Google. Las instalaciones de escritorio nunca reciben el Client ID, Client Secret ni el refresh token: únicamente conocen la URL del servicio y una clave común de la API.
+Backend privado de GymControl para centralizar las credenciales de Google. Las instalaciones de escritorio nunca reciben el Client ID, Client Secret ni el refresh token: el programa genera una clave aleatoria local y la registra automáticamente al primer uso cloud.
 
-El servidor guarda o reemplaza `GymControl_Respaldo_<HWID>.db` en Google Drive y puede compartirlo con una dirección y enviar el enlace mediante Gmail. Cada HWID conserva un único nombre estable. Si hay duplicados históricos con el mismo nombre, el servicio intenta eliminarlos después de verificar la nueva subida.
+El servidor guarda o reemplaza `GymControl_Respaldo_<HWID>.db` en Google Drive y puede compartirlo con una dirección y enviar el enlace mediante Gmail. Cada instalación conserva su propio archivo mediante la huella de su clave, aunque otra instalación tenga el mismo HWID corto. Si hay duplicados históricos de esa instalación, el servicio intenta eliminarlos después de verificar la nueva subida.
 
 ## Requisitos
 
@@ -22,7 +22,6 @@ Obligatorias desde el primer despliegue:
 | `GOOGLE_CLIENT_ID` | Client ID del cliente OAuth web del backend. |
 | `GOOGLE_CLIENT_SECRET` | Client Secret de ese mismo cliente. |
 | `GOOGLE_REDIRECT_URI` | Callback HTTPS exacto registrado en Google. |
-| `GYMCONTROL_API_KEY` | Bearer compartido por las instalaciones autorizadas. Mínimo 32 caracteres. |
 | `OAUTH_ADMIN_KEY` | Bearer reservado para el bootstrap OAuth. Mínimo 32 caracteres. |
 | `OAUTH_STATE_SECRET` | Firma el parámetro OAuth `state`. Mínimo 32 caracteres. |
 
@@ -55,7 +54,7 @@ Genera tres valores independientes. No reutilices el Client Secret ni guardes va
 
 ## Bootstrap OAuth sin exponer el refresh token en logs
 
-El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Los códigos temporales se guardan en memoria y vencen en diez minutos, por lo que el flujo debe completarse sobre la misma instancia y sin redeploy intermedio.
+El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Antes de autorizar, deja esa variable ausente o vacía en Render; un texto de ejemplo también bloquea el inicio del flujo. El código de canje alternativo se guarda en memoria durante 30 minutos, por lo que debe usarse antes de reiniciar la instancia.
 
 1. Define en tu consola la URL y la clave administrativa que ya cargaste en Render:
 
@@ -71,9 +70,9 @@ El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Los códigos temporales se 
    Start-Process $inicio.authorizationUrl
    ```
 
-3. Autoriza la cuenta propietaria. El callback muestra un **código de entrega** de un solo uso; nunca imprime el refresh token en los logs.
+3. Autoriza la cuenta propietaria. El callback muestra el **refresh token** para copiar directamente a Render y un código de entrega alternativo. No compartas el token ni una captura de esa página.
 
-4. Canjea inmediatamente el código:
+4. Sólo si no pudiste copiar el token del callback, canjea el código alternativo antes de que venza:
 
    ```powershell
    $cuerpo = @{ codigo = "CODIGO_MOSTRADO_POR_EL_CALLBACK" } | ConvertTo-Json
@@ -82,9 +81,9 @@ El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Los códigos temporales se 
    $resultado.refreshToken
    ```
 
-5. Copia el valor a `GOOGLE_REFRESH_TOKEN` en Render y vuelve a desplegar. Con esa variable presente, `/oauth/google/start` queda bloqueado. Para rotar el token, retira temporalmente la variable, despliega y repite este flujo.
+5. Guarda el token real como `GOOGLE_REFRESH_TOKEN` en Render y vuelve a desplegar. Con esa variable presente, `/oauth/google/start` queda bloqueado. Para rotar el token, retira temporalmente la variable, despliega y repite este flujo.
 
-`GET /health` confirma el estado sin revelar secretos:
+`GET /health` informa si el proceso tiene un valor no vacío de refresh token, sin revelar secretos. **No valida ese valor contra Google**: un texto de prueba también produce `googleOAuthConfigurado: true`.
 
 ```json
 {
@@ -97,7 +96,9 @@ El backend puede iniciar sin `GOOGLE_REFRESH_TOKEN`. Los códigos temporales se 
 
 ## Contrato de la aplicación de escritorio
 
-Todas las rutas `/api/v1` requieren `Authorization: Bearer <GYMCONTROL_API_KEY>`.
+El instalador es único: en el primer arranque, el cliente crea `%LOCALAPPDATA%\GymControl\gymcontrol-cloud.json` con la URL pública y una clave aleatoria propia. Al usar Drive o Gmail por primera vez, registra esa clave mediante `POST /api/v1/clients/<HWID>/register`; la API guarda únicamente su huella SHA-256 en Drive. El registro puede realizarse durante los 15 días de prueba. Si no hay conexión, el programa local sigue funcionando y el registro se reintenta en la siguiente operación cloud. No se configura ninguna clave por equipo en Render ni se incluye una clave compartida en el instalador.
+
+Las demás rutas `/api/v1` requieren `Authorization: Bearer <clave local>` y `X-HWID: <HWID>`. La API comprueba la clave contra su registro persistente y separa los archivos por la huella de esa clave, incluso si dos equipos coinciden en el HWID corto. Falla de forma cerrada cuando Google no está disponible. El registro abierto tiene límite de solicitudes, pero no impide que alguien instale múltiples clientes y consuma recursos cloud; hay que vigilar sus cuotas. Si se borra el archivo local, la nueva instalación obtiene otra identidad cloud y no podrá acceder a sus respaldos anteriores sin ayuda de soporte.
 
 ### Reportes mensuales de caja
 
@@ -107,6 +108,7 @@ El escritorio genera `ReporteCaja_YYYY-MM_<HWID>_PARCIAL.xlsx` para el mes en cu
 
 ```http
 PUT /api/v1/reports/cash/GYM-1234-A/2026-09/FINAL
+X-HWID: GYM-1234-A
 Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 X-Content-SHA256: <64 caracteres hexadecimales>
 Authorization: Bearer <clave>
@@ -115,15 +117,16 @@ Authorization: Bearer <clave>
 ```
 
 El backend lo guarda en la subcarpeta `Reportes_Caja` de la carpeta de respaldos.
-Al consolidar un período elimina su parcial y mantiene únicamente los dos meses
-finales más recientes por equipo. Los errores de borrado se registran sin cancelar
-la subida; la respuesta incluye `fallosLimpieza`. Un reporte histórico fuera de esos
-dos meses permanece local, y `conservadoEnDrive` informa `false`.
+Al consolidar un período elimina su parcial y conserva como máximo los doce meses
+consolidados consecutivos más recientes por equipo. Los errores de borrado se registran
+sin cancelar la subida; la respuesta incluye `fallosLimpieza`. Un reporte histórico
+fuera de esa ventana permanece local, y `conservadoEnDrive` informa `false`.
 
 Para adjuntarlo por Gmail sin guardar credenciales de Google en el equipo:
 
 ```http
 POST /api/v1/reports/cash/GYM-1234-A/2026-09/FINAL/email
+X-HWID: GYM-1234-A
 Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
 X-Content-SHA256: <64 caracteres hexadecimales>
 X-Recipient-Email: persona@ejemplo.com
@@ -139,6 +142,7 @@ HWID, período y estado validados; no aceptan nombres arbitrarios del cliente.
 
 ```http
 PUT /api/v1/backups/GYM-1234-A
+X-HWID: GYM-1234-A
 Content-Type: application/x-sqlite3
 X-Content-SHA256: <64 caracteres hexadecimales>
 Authorization: Bearer <clave>
@@ -211,5 +215,5 @@ El `Dockerfile` usa Node 24, instala dependencias desde `pnpm-lock.yaml` y ejecu
 
 - Rota cualquier credencial que haya sido publicada en una conversación, captura o commit.
 - Mantén `OAUTH_ADMIN_KEY` fuera de los equipos cliente.
-- La clave común `GYMCONTROL_API_KEY` evita accesos casuales, pero cualquier instalación puede extraerla de su configuración local. Para un despliegue de mayor riesgo, el siguiente paso es emitir credenciales revocables por instalación.
+- Cada instalación genera su clave fuera del ejecutable. Para revocarla, elimina el registro `GymControl_Cliente_<SHA256 de la clave>.json` en la carpeta de Drive administrada por la API; después restablece el archivo local de esa instalación mediante soporte.
 - Los errores y logs nunca incluyen tokens, claves ni cuerpos de bases de datos.

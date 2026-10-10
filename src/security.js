@@ -24,6 +24,39 @@ function autenticarBearer(secretoEsperado, codigoError = 'NO_AUTORIZADO') {
   };
 }
 
+function recibirCredencialCliente(req, _res, next) {
+    const token = extraerBearer(req.get('authorization'));
+    const hwid = req.params.hwid;
+    if (!validarHwid(hwid) || token.length < 32 || token.length > 256 ||
+        !/^[A-Za-z0-9+/=_-]+$/.test(token)) {
+      next(new ErrorHttp(401, 'API_KEY_INVALIDA', 'La credencial de acceso no es válida.'));
+      return;
+    }
+    if (req.get('x-hwid') !== hwid) {
+      next(new ErrorHttp(403, 'HWID_NO_AUTORIZADO', 'El identificador del equipo no coincide con la credencial.'));
+      return;
+    }
+    req.hwidAutenticado = hwid;
+    req.credencialCliente = token;
+    next();
+}
+
+function autenticarCliente(servicioGoogle) {
+  return [recibirCredencialCliente, async (req, _res, next) => {
+    try {
+      const clienteId = await servicioGoogle.autenticarCliente(
+        req.hwidAutenticado, req.credencialCliente);
+      if (!clienteId) {
+        throw new ErrorHttp(401, 'API_KEY_INVALIDA', 'La credencial de acceso no es válida.');
+      }
+      req.clienteId = clienteId;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  }];
+}
+
 function validarHwid(hwid) {
   return typeof hwid === 'string' && /^GYM-\d{4}-[A-Z]$/.test(hwid);
 }
@@ -35,4 +68,5 @@ function validarCorreo(correo) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(correo);
 }
 
-module.exports = { autenticarBearer, compararSeguro, validarCorreo, validarHwid };
+module.exports = { autenticarBearer, autenticarCliente, recibirCredencialCliente,
+  compararSeguro, validarCorreo, validarHwid };

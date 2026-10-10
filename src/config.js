@@ -67,12 +67,11 @@ function cargarConfiguracion(env = process.env) {
     'GOOGLE_REDIRECT_URI'
   );
 
-  const apiKey = secreto(env, 'GYMCONTROL_API_KEY');
   const oauthAdminKey = secreto(env, 'OAUTH_ADMIN_KEY');
   const oauthStateSecret = secreto(env, 'OAUTH_STATE_SECRET');
-  if (new Set([apiKey, oauthAdminKey, oauthStateSecret]).size !== 3) {
+  if (oauthAdminKey === oauthStateSecret) {
     throw new ErrorConfiguracion(
-      'GYMCONTROL_API_KEY, OAUTH_ADMIN_KEY y OAUTH_STATE_SECRET deben ser valores diferentes.'
+      'OAUTH_ADMIN_KEY y OAUTH_STATE_SECRET deben ser diferentes.'
     );
   }
 
@@ -80,7 +79,6 @@ function cargarConfiguracion(env = process.env) {
     entorno: texto(env, 'NODE_ENV', { valorPredeterminado: 'production' }),
     puerto: entero(env, 'PORT', 3000, 1, 65_535),
     confiarProxy: texto(env, 'TRUST_PROXY', { valorPredeterminado: '1' }) !== '0',
-    apiKey,
     oauthAdminKey,
     oauthStateSecret,
     google: Object.freeze({
