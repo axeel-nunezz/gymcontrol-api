@@ -34,6 +34,8 @@ class ServicioGoogle {
     this.promesaCarpeta = null;
     this.promesaCarpetaCaja = null;
     this.bloqueosPorHwid = new Map();
+    this.registrosClienteRecientes = new Map();
+    this.archivosRecientes = new Map();
     this.#aplicarCredenciales();
   }
 
@@ -55,6 +57,14 @@ class ServicioGoogle {
     return this.#serializarPorHwid(huella, async () => {
       this.#exigirConfiguracion();
       try {
+        const reciente = await this.#registroReciente(huella);
+        if (reciente) {
+          if (reciente.appProperties.gymcontrolHwid !== hwid) {
+            throw new ErrorHttp(409, 'EQUIPO_YA_REGISTRADO',
+              'La clave de esta instalación está asociada a otro identificador de equipo.');
+          }
+          return { registrado: true, creado: false };
+        }
         const registros = await this.#buscarRegistrosCliente(huella);
         if (registros.length > 1) {
           throw new ErrorHttp(503, 'REGISTRO_AMBIGUO',
@@ -65,6 +75,7 @@ class ServicioGoogle {
             throw new ErrorHttp(409, 'EQUIPO_YA_REGISTRADO',
               'La clave de esta instalación está asociada a otro identificador de equipo.');
           }
+          this.#recordarRegistro(huella, registros[0].id);
           return { registrado: true, creado: false };
         }
         const carpetaId = await this.#obtenerCarpetaId();
@@ -78,6 +89,7 @@ class ServicioGoogle {
           throw new ErrorHttp(502, 'REGISTRO_NO_CONFIRMADO',
             'Drive no confirmó el registro del equipo. Intente nuevamente.');
         }
+        this.#recordarRegistro(huella, creado.data.id);
         return { registrado: true, creado: true };
       } catch (error) {
         if (error instanceof ErrorHttp) throw error;
@@ -90,13 +102,16 @@ class ServicioGoogle {
     this.#exigirConfiguracion();
     try {
       const recibida = crypto.createHash('sha256').update(clave).digest('hex');
+      const reciente = await this.#registroReciente(recibida);
+      if (reciente) return reciente.appProperties.gymcontrolHwid === hwid ? recibida : null;
       const registros = await this.#buscarRegistrosCliente(recibida);
       if (registros.length !== 1) return null;
       const esperada = registros[0].appProperties?.gymcontrolClaveHash;
-      return registros[0].appProperties?.gymcontrolHwid === hwid &&
+      const valido = registros[0].appProperties?.gymcontrolHwid === hwid &&
         typeof esperada === 'string' && esperada.length === 64 &&
-        crypto.timingSafeEqual(Buffer.from(esperada, 'hex'), Buffer.from(recibida, 'hex'))
-        ? recibida : null;
+        crypto.timingSafeEqual(Buffer.from(esperada, 'hex'), Buffer.from(recibida, 'hex'));
+      if (valido) this.#recordarRegistro(recibida, registros[0].id);
+      return valido ? recibida : null;
     } catch (error) {
       if (error instanceof ErrorHttp) throw error;
       throw errorGoogle('autenticar el equipo', error);
@@ -115,6 +130,33 @@ class ServicioGoogle {
     return (respuesta.data.files || []).filter((archivo) =>
       archivo.appProperties?.gymcontrolOrigen === 'GymControlCliente' &&
       archivo.appProperties?.gymcontrolClaveHash === huella);
+  }
+
+  async #registroReciente(huella) {
+    const registroId = this.registrosClienteRecientes.get(huella);
+    if (!registroId) return null;
+    try {
+      const [carpetaId, respuesta] = await Promise.all([
+        this.#obtenerCarpetaId(),
+        this.drive.files.get({ fileId: registroId, supportsAllDrives: true,
+          fields: 'id,parents,trashed,appProperties' })
+      ]);
+      const registro = respuesta.data;
+      if (!registro?.trashed && registro?.parents?.includes(carpetaId) &&
+          registro.appProperties?.gymcontrolOrigen === 'GymControlCliente' &&
+          registro.appProperties?.gymcontrolClaveHash === huella) return registro;
+    } catch (error) {
+      if (Number(error.code || error.response?.status) !== 404) throw error;
+    }
+    this.registrosClienteRecientes.delete(huella);
+    return null;
+  }
+
+  #recordarRegistro(huella, archivoId) {
+    this.registrosClienteRecientes.set(huella, archivoId);
+    if (this.registrosClienteRecientes.size > 512) {
+      this.registrosClienteRecientes.delete(this.registrosClienteRecientes.keys().next().value);
+    }
   }
 
   async subirRespaldo(datos) {
@@ -167,6 +209,7 @@ class ServicioGoogle {
             mimeType: media.mimeType, appProperties: propiedades }, media, fields: 'id' });
         archivoId = creado.data.id;
       }
+      this.#recordarArchivo(carpetaId, nombreArchivo, hwid, 'GymControlCaja', clienteId, archivoId);
       const metadatos = await this.#obtenerMetadatos(archivoId);
       if (Number(metadatos.size) !== contenido.length || metadatos.md5Checksum !== md5) {
         throw new ErrorHttp(502, 'REPORTE_NO_VERIFICADO',
@@ -292,6 +335,7 @@ class ServicioGoogle {
         });
         archivoId = respuesta.data.id;
       }
+      this.#recordarArchivo(carpetaId, nombreArchivo, hwid, 'GymControl', clienteId, archivoId);
 
       const archivo = await this.#obtenerMetadatos(archivoId);
       if (Number(archivo.size) !== contenido.length || archivo.md5Checksum !== md5Local) {
@@ -536,19 +580,55 @@ class ServicioGoogle {
   }
 
   async #buscarArchivos(carpetaId, nombreArchivo, hwid, origen, clienteId) {
-    const respuesta = await this.drive.files.list({
-      q: `'${escaparConsultaDrive(carpetaId)}' in parents and name = '${escaparConsultaDrive(nombreArchivo)}' and trashed = false`,
-      spaces: 'drive',
-      pageSize: 100,
-      orderBy: 'modifiedTime desc',
-      fields: 'files(id,name,size,md5Checksum,webViewLink,webContentLink,modifiedTime,appProperties)',
-      supportsAllDrives: true,
-      includeItemsFromAllDrives: true
-    });
-    return (respuesta.data.files || []).filter((archivo) =>
-      archivo.appProperties?.gymcontrolHwid === hwid &&
-      archivo.appProperties?.gymcontrolOrigen === origen &&
-      archivo.appProperties?.gymcontrolCliente === clienteId);
+    const clave = JSON.stringify([carpetaId, nombreArchivo, hwid, origen, clienteId]);
+    const archivos = [];
+    const recienteId = this.archivosRecientes.get(clave);
+    if (recienteId) {
+      try {
+        const respuesta = await this.drive.files.get({ fileId: recienteId,
+          supportsAllDrives: true,
+          fields: 'id,name,parents,trashed,appProperties,modifiedTime,size,md5Checksum,webViewLink,webContentLink' });
+        const archivo = respuesta.data;
+        if (!archivo?.trashed && archivo?.name === nombreArchivo &&
+            archivo?.parents?.includes(carpetaId) &&
+            archivo.appProperties?.gymcontrolHwid === hwid &&
+            archivo.appProperties?.gymcontrolOrigen === origen &&
+            archivo.appProperties?.gymcontrolCliente === clienteId) archivos.push(archivo);
+        else this.archivosRecientes.delete(clave);
+      } catch (error) {
+        if (Number(error.code || error.response?.status) !== 404) throw error;
+        this.archivosRecientes.delete(clave);
+      }
+    }
+    let pageToken;
+    do {
+      const respuesta = await this.drive.files.list({
+        q: `'${escaparConsultaDrive(carpetaId)}' in parents and name = '${escaparConsultaDrive(nombreArchivo)}' and trashed = false`,
+        spaces: 'drive', pageSize: 1000, pageToken,
+        orderBy: 'modifiedTime desc',
+        fields: 'nextPageToken,files(id,name,size,md5Checksum,webViewLink,webContentLink,modifiedTime,appProperties)',
+        supportsAllDrives: true, includeItemsFromAllDrives: true
+      });
+      for (const archivo of respuesta.data.files || []) {
+        if (archivo.appProperties?.gymcontrolHwid === hwid &&
+            archivo.appProperties?.gymcontrolOrigen === origen &&
+            archivo.appProperties?.gymcontrolCliente === clienteId &&
+            !archivos.some((actual) => actual.id === archivo.id)) archivos.push(archivo);
+      }
+      pageToken = respuesta.data.nextPageToken;
+    } while (pageToken);
+    if (archivos.length && !this.archivosRecientes.has(clave)) this.#recordarArchivo(
+      carpetaId, nombreArchivo, hwid, origen, clienteId, archivos[0].id);
+    return archivos;
+  }
+
+  #recordarArchivo(carpetaId, nombreArchivo, hwid, origen, clienteId, archivoId) {
+    if (!archivoId) return;
+    const clave = JSON.stringify([carpetaId, nombreArchivo, hwid, origen, clienteId]);
+    this.archivosRecientes.set(clave, archivoId);
+    if (this.archivosRecientes.size > 512) {
+      this.archivosRecientes.delete(this.archivosRecientes.keys().next().value);
+    }
   }
 
   async #obtenerMetadatos(archivoId) {
